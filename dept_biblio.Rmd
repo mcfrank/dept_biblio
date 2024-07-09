@@ -1,0 +1,477 @@
+---
+title: "Dept Bibliometrics Sketch"
+author: "Mike Frank"
+date: "5/2/2022"
+output: html_document
+---
+
+```{r}
+library(rscopus)
+library(tidyverse)
+library(igraph)
+library(GGally)
+```
+
+Use Scopus. 
+
+```{r}
+set_api_key(api_key = "dd744cd6d9fe11c08902d925a300fbc0")
+```
+
+Get stanford and deepmind (for McClelland) affiliation ids. 
+
+```{r}
+stanford <- get_affiliation_info(affil_name = "Stanford") |>
+  slice(1) |> 
+  pull(affil_id)
+
+deepmind <- get_affiliation_info(affil_name = "DeepMind") |>
+  slice(1) |> 
+  pull(affil_id)
+
+gsb <- get_affiliation_info(affil_name = "Stanford Graduate School of Business") |>
+  slice(1) |> 
+  pull(affil_id)
+```
+
+Read in a faculty spreadsheet and then get their identifier for disambiguation. 
+
+```{r}
+faculty <- read_csv("faculty.csv") 
+faculty$affiliation <- stanford
+faculty$affiliation[11] <- deepmind
+faculty$affiliation[29] <- gsb
+faculty$first[8] <- "Michael C."
+
+faculty$au_id <- NA
+for (i in 1:nrow(faculty)) {
+  print(i)
+  Sys.sleep(.5)
+  au_id <- get_author_info(last_name = faculty$last[i], 
+                           first_name = faculty$first[i],
+                           affil_id = faculty$affiliation[i])$au_id[1]
+  faculty$au_id[i] = ifelse(!is.null(au_id), au_id, NA)
+}
+```
+
+Get all articles by each faculty member. 
+
+```{r}
+articles <- faculty |>
+  mutate(idx = 1:n()) %>%
+  split(.$idx) |>
+  map_df(function(f) {
+    
+    print(f$idx)
+    Sys.sleep(.5)
+    
+    author_df(au_id = f$au_id,
+              affil_id = f$affiliation, 
+              verbose=FALSE) |>
+      mutate(faculty = f$last)
+  })
+
+write_csv(articles,"stanford_articles.csv")
+```
+Identify multi-faculty authored articles. 
+
+```{r}
+articles <- as_tibble(articles)
+
+multi_author <- articles |> 
+  group_by(`dc:identifier`) |>
+  summarise(n_authors = length(unique(faculty))) |>
+  filter(n_authors > 1)
+```
+
+Wrangle these into an edge list. 
+
+```{r}
+edgelist <- left_join(multi_author, 
+                      select(articles, `dc:identifier`, faculty)) |>
+  rename(id = `dc:identifier`) %>%
+  group_by(id) |>
+  mutate(i = 1:n()) |>
+  pivot_wider(names_from = i, values_from = "faculty") 
+
+edgelist_3 <- filter(edgelist, !is.na(`3`)) %>%
+  split(.$id) %>%
+  map_df(function(x) {
+    tibble(id = x$id, 
+           n_authors = 3, 
+           `1` = c(x$`1`[1], x$`1`[1]), 
+           `2` = c(x$`2`[1], x$`3`[1]))
+  })
+
+edgelist_2 <- filter(edgelist, is.na(`3`)) |>
+  arrange(id)
+
+edgelist_full <- edgelist_2 |>
+  bind_rows(edgelist_3) |> 
+  ungroup() |>
+  select(`1`,`2`) |>
+  group_by(`1`,`2`) |>
+  count()
+
+```
+
+Turn this into a matrix and plot. 
+
+```{r}
+mat <- as.matrix(edgelist_full[,1:2], ncol = 2)
+g <- graph_from_edgelist(mat, directed=FALSE)
+
+area <- as.factor(unlist(map(names(V(g)), 
+                             function(x) {filter(faculty, last == x)$area})))
+# V(g)$color <- area
+# E(g)$weight <- edgelist_full$n
+# 
+# plot(g)
+
+GGally::ggnet2(g,
+               label = TRUE,
+               mode = "kamadakawai",
+               node.color = area,
+               edge.size = edgelist_full$n/3,
+               color.palette = c("Affective" = "red",
+                                 "Cognitive" = "green",
+                                 "Developmental" = "blue",
+                                 "Neuroscience" = "orange",
+                                 "Social" = "purple",
+                                 "Developmental/Social" = "gray",
+                                 "Cognitive/Developmental" = "brown"))
+```
+
+# Word cloud
+
+```{r}
+library(tidytext)
+library(wordcloud)
+```
+
+from https://richpauloo.github.io/2017-12-29-Using-tidytext-to-make-word-clouds/
+
+```{r}
+tokens <- articles |>
+  select(`dc:description`) |> 
+  rename(description = `dc:description`) %>%
+  filter(!is.na(description)) |>
+  unnest_tokens(output = "word", input = "description") %>% 
+  count(word, sort = TRUE) %>% 
+  ungroup()
+
+data("stop_words")
+tokens_clean <- tokens %>%
+  anti_join(stop_words)
+
+nums <- tokens_clean %>% 
+  filter(str_detect(word, "^[0-9]")) %>% 
+  select(word) %>% unique()
+
+tokens_clean <- tokens_clean %>% 
+  anti_join(nums, by = "word")
+```
+
+```{r}
+pal <- brewer.pal(8,"Dark2")
+
+# plot the 50 most common words
+tokens_clean %>% 
+  with(wordcloud(word, n, random.order = FALSE, max.words = 100, colors=pal))
+```
+
+# Skipgrams
+
+https://cbail.github.io/textasdata/word2vec/rmarkdown/word2vec.html
+
+Now we can calculate the Skipgram probabilities– or how often we find each word next to every other word within the context window. In this example we’ve set our context window to have a length of eight words. The code is a bit involved because we have to normalize the skipgram probabilities according to the unigram probabilities (or the overall frequency of each word in the corpus)
+
+
+```{r}
+library(widyr)
+
+texts <- articles |>
+  rename(text = `dc:description`, postID = `dc:identifier`) %>%
+  select(postID, text)
+
+#create context window with length 8
+tidy_skipgrams <- texts |> 
+  unnest_tokens(output = "ngram", input = "text", token = "ngrams", n = 8) %>%
+  mutate(ngramID = row_number()) %>% 
+  tidyr::unite(skipgramID, postID, ngramID) %>%
+  unnest_tokens(word, ngram)
+
+words <- texts |> 
+  unnest_tokens(output = "word", input = "text") 
+```
+
+calculate unigram probabilities (used to normalize skipgram probabilities later)
+
+```{r}
+unigram_probs <- texts %>%
+    unnest_tokens(word, text) %>%
+    count(word, sort = TRUE) %>%
+    mutate(p = n / sum(n))
+```
+
+calculate probabilities
+
+```{r}
+skipgram_probs <- tidy_skipgrams %>%
+    pairwise_count(word, skipgramID, diag = TRUE, sort = TRUE) %>%
+    mutate(p = n / sum(n))
+```
+
+
+normalize probabilities
+
+```{r}
+normalized_prob <- skipgram_probs %>%
+    filter(n > 20) %>%
+    rename(word1 = item1, word2 = item2) %>%
+    left_join(unigram_probs %>%
+                  select(word1 = word, p1 = p),
+              by = "word1") %>%
+    left_join(unigram_probs %>%
+                  select(word2 = word, p2 = p),
+              by = "word2") %>%
+    mutate(p_together = p / p1 / p2)
+```
+
+Let’s look at a few lines of the output to get a better sense of what we are doing:
+
+```{r}
+normalized_prob[2005:2010,]
+```
+
+The variable p_together here describes the probability the word2 occurs within the context window of word1.
+
+```{r}
+pmi_matrix <- normalized_prob %>%
+    mutate(pmi = log10(p_together)) %>%
+    cast_sparse(word1, word2, pmi)
+
+```
+
+```{r}
+library(irlba)
+```
+
+
+
+```{r}
+# remove missing data
+pmi_matrix@x[is.na(pmi_matrix@x)] <- 0
+pmi_svd <- irlba(pmi_matrix, 2, maxit = 500)
+
+#next we output the word vectors:
+word_vectors <- pmi_svd$u
+rownames(word_vectors) <- rownames(pmi_matrix)
+
+#grab 100 words
+forplot<-as.data.frame(word_vectors[1:300,])
+forplot$word<-rownames(forplot)
+
+#now plot
+
+ggplot(forplot, aes(x=V1, y=V2, label=word))+
+  geom_text(aes(label=word),hjust=0, vjust=0, color="blue")+
+  theme_minimal()+
+  xlab("First Dimension Created by SVD")+
+  ylab("Second Dimension Created by SVD")
+```
+
+
+Merge
+
+```{r}
+doc_vecs <- words |>
+  left_join(as_tibble(word_vectors) |> 
+              mutate(word = rownames(word_vectors))) |>
+  filter(!is.na(V1)) 
+
+
+article_vecs <- doc_vecs |>
+  group_by(postID) |>
+  summarise(V1 = mean(V1), 
+            V2 = mean(V2)) 
+
+
+fac_vecs <- article_vecs |>
+  left_join(articles |>
+              rename(postID = `dc:identifier`) |>
+              select(postID, faculty)) |>
+  group_by(faculty) |>
+  summarise(V1 = mean(V1), 
+            V2 = mean(V2)) |>
+  left_join(faculty |> rename(faculty = last))
+```
+
+```{r}
+
+ggplot(fac_vecs, 
+       aes(x = V1, y = V2, label = faculty, col = area)) + 
+  geom_point() + 
+  ggrepel::geom_label_repel() + 
+  xlab("Dimension 1") + 
+  ylab("Dimension 2") + 
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+```
+
+# gloVe
+
+```{r}
+library(data.table)
+summarise <- dplyr::summarise
+
+glove <- data.table::fread(file = "glove.6B.50d.txt", sep = " ")
+
+doc_vecs <- words |>
+  left_join(glove |> rename(word = V1)) |>
+  filter(!is.na(V2)) 
+
+article_vecs <- doc_vecs |>
+  group_by(postID) |>
+  summarise(across(V2:V51, ~mean(.x))) 
+
+# gross part to remove dupes
+unique_article_vecs <- filter(article_vecs, !duplicated(article_vecs[,2:51]))
+ts <- Rtsne::Rtsne(unique_article_vecs[,2:51])
+
+ts_fac_vecs <- as_tibble(ts$Y) |>
+  mutate(postID = unique_article_vecs$postID) |>
+  left_join(articles |>
+              rename(postID = `dc:identifier`) |>
+              select(postID, faculty)) |>
+  group_by(faculty) |>
+  summarise(across(V1:V2, ~mean(.x))) |>
+  left_join(faculty |> rename(faculty = last))
+```
+
+```{r}
+ggplot(ts_fac_vecs, 
+       aes(x = V1, y = V2, label = faculty, col = area)) + 
+  geom_point() + 
+  ggrepel::geom_label_repel() + 
+  xlab("Dimension 1") + 
+  ylab("Dimension 2") + 
+  theme_minimal() + 
+  theme(legend.position = "bottom")
+```
+
+<!-- # Harvard -->
+
+<!-- ```{r} -->
+<!-- harvard <- get_affiliation_info(affil_name = "Harvard") |> -->
+<!--   slice(1) |>  -->
+<!--   pull(affil_id) -->
+<!-- ``` -->
+
+<!-- Read in a faculty spreadsheet and then get their identifier for disambiguation.  -->
+
+<!-- ```{r} -->
+<!-- faculty <- read_csv("faculty.csv")  -->
+<!-- faculty$affiliation <- stanford -->
+
+<!-- faculty$au_id <- NA -->
+<!-- for (i in 1:nrow(faculty)) { -->
+<!--   print(i) -->
+<!--   Sys.sleep(.5) -->
+<!--   au_id <- get_author_info(last_name = faculty$last[i],  -->
+<!--                                      first_name = faculty$first[i], -->
+<!--                                      affil_id = faculty$affiliation[i])$au_id[1] -->
+<!--   faculty$au_id[i] = ifelse(!is.null(au_id), au_id, NA) -->
+<!-- } -->
+<!-- ``` -->
+
+<!-- Get all articles by each faculty member.  -->
+
+<!-- ```{r} -->
+<!-- articles <- faculty |> -->
+<!--   mutate(idx = 1:n()) %>% -->
+<!--   split(.$idx) |> -->
+<!--   map_df(function(f) { -->
+
+<!--     print(f$idx) -->
+<!--     Sys.sleep(.5) -->
+
+<!--     author_df(last_name = f$last,  -->
+<!--               first_name = f$first,  -->
+<!--               au_id = f$au_id, -->
+<!--               affil_id = f$affiliation,  -->
+<!--               verbose=FALSE) |> -->
+<!--       select(-`dc:description`) |> -->
+<!--       mutate(faculty = f$last) -->
+<!--   }) -->
+
+<!-- ``` -->
+<!-- Identify multi-faculty authored articles.  -->
+
+<!-- ```{r} -->
+<!-- articles <- as_tibble(articles) -->
+
+<!-- multi_author <- articles |>  -->
+<!--   group_by(`dc:identifier`) |> -->
+<!--   summarise(n_authors = length(unique(faculty))) |> -->
+<!--   filter(n_authors > 1) -->
+<!-- ``` -->
+
+<!-- Wrangle these into an edge list.  -->
+
+<!-- ```{r} -->
+<!-- edgelist <- left_join(multi_author,  -->
+<!--                       select(articles, `dc:identifier`, faculty)) |> -->
+<!--   rename(id = `dc:identifier`) %>% -->
+<!--   group_by(id) |> -->
+<!--   mutate(i = 1:n()) |> -->
+<!--   pivot_wider(names_from = i, values_from = "faculty")  -->
+
+<!-- edgelist_3 <- filter(edgelist, !is.na(`3`)) %>% -->
+<!--   split(.$id) %>% -->
+<!--   map_df(function(x) { -->
+<!--     tibble(id = x$id,  -->
+<!--            n_authors = 3,  -->
+<!--            `1` = c(x$`1`[1], x$`1`[1]),  -->
+<!--            `2` = c(x$`2`[1], x$`3`[1])) -->
+<!--   }) -->
+
+<!-- edgelist_2 <- filter(edgelist, is.na(`3`)) |> -->
+<!--   arrange(id) -->
+
+<!-- edgelist_full <- edgelist_2 |> -->
+<!--   bind_rows(edgelist_3) |>  -->
+<!--   ungroup() |> -->
+<!--   select(`1`,`2`) |> -->
+<!--   group_by(`1`,`2`) |> -->
+<!--   count() -->
+
+<!-- ``` -->
+
+<!-- Turn this into a matrix and plot.  -->
+
+<!-- ```{r} -->
+<!-- mat <- as.matrix(edgelist_full[,1:2], ncol = 2) -->
+<!-- g <- graph_from_edgelist(mat, directed=FALSE) -->
+
+<!-- area <- as.factor(unlist(map(names(V(g)),  -->
+<!--                              function(x) {filter(faculty, last == x)$area}))) -->
+<!-- # V(g)$color <- area -->
+<!-- # E(g)$weight <- edgelist_full$n -->
+<!-- #  -->
+<!-- # plot(g) -->
+
+<!-- GGally::ggnet2(g, -->
+<!--                label = TRUE, -->
+<!--                mode = "kamadakawai", -->
+<!--                node.color = area, -->
+<!--                edge.size = edgelist_full$n/3, -->
+<!--                color.palette = c("Affective" = "red", -->
+<!--                                  "Cognitive" = "green", -->
+<!--                                  "Developmental" = "blue", -->
+<!--                                  "Neuroscience" = "orange", -->
+<!--                                  "Social" = "purple")) -->
+<!-- ``` -->
+
+
+
